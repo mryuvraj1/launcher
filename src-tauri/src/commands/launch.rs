@@ -159,8 +159,8 @@ pub fn running_games() -> Vec<String> { engine::running_games() }
 
 #[tauri::command]
 pub async fn ping_server(addr: String) -> Result<engine::PingResult, String> {
-    let addr = engine::resolve_srv(&addr).await;
-    tauri::async_runtime::spawn_blocking(move || engine::ping(&addr))
+    let candidates = engine::resolve_srv(&addr).await;
+    tauri::async_runtime::spawn_blocking(move || engine::ping_candidates(&candidates))
         .await
         .map_err(|e| e.to_string())?
 }

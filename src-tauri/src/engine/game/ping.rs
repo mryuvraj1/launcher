@@ -89,6 +89,23 @@ fn split_host_port(addr: &str) -> (String, u16) {
 }
 
 const SRV_WAIT: Duration = Duration::from_secs(3);
+const MAX_SRV_TARGETS: usize = 4;
+const MAX_ADDRESSES_PER_TARGET: usize = 2;
+
+fn ordered_srv_candidates(mut records: Vec<(u16, String)>) -> Vec<String> {
+    records.retain(|(_, endpoint)| !endpoint.is_empty());
+    records.sort_by_key(|(priority, _)| *priority);
+    let mut candidates = Vec::new();
+    for (_, endpoint) in records {
+        if !candidates.contains(&endpoint) {
+            candidates.push(endpoint);
+        }
+        if candidates.len() == MAX_SRV_TARGETS {
+            break;
+        }
+    }
+    candidates
+}
 
 fn srv_name(addr: &str) -> Option<String> {
     let (host, port) = split_host_port(addr);
@@ -99,30 +116,91 @@ fn srv_name(addr: &str) -> Option<String> {
     Some(format!("_minecraft._tcp.{}", host.trim_end_matches('.')))
 }
 
-/// The address the game itself would connect to: a name without a port is
-/// looked up as `_minecraft._tcp.<name>` first, because its A record often
-/// points at the website instead of the game server. Any lookup failure keeps
-/// the address as given, as the game does.
-pub async fn resolve_srv(addr: &str) -> String {
+/// Candidate endpoints for a status check. A name without a port is looked up
+/// as `_minecraft._tcp.<name>` first; an unavailable SRV lookup falls back to
+/// the address the player entered.
+pub async fn resolve_srv(addr: &str) -> Vec<String> {
     use hickory_resolver::TokioResolver;
     static RESOLVER: std::sync::OnceLock<Option<TokioResolver>> = std::sync::OnceLock::new();
-    let Some(name) = srv_name(addr) else { return addr.to_string() };
+    let Some(name) = srv_name(addr) else { return vec![addr.to_string()] };
     let resolver = RESOLVER.get_or_init(|| TokioResolver::builder_tokio().map(|b| b.build()).ok());
-    let Some(resolver) = resolver else { return addr.to_string() };
+    let Some(resolver) = resolver else { return vec![addr.to_string()] };
     let found = match tokio::time::timeout(SRV_WAIT, resolver.srv_lookup(name)).await {
         Ok(Ok(found)) => found,
-        _ => return addr.to_string(),
+        _ => return vec![addr.to_string()],
     };
-    found
+    let records = found
         .iter()
-        .min_by_key(|r| r.priority())
-        .map(|r| (r.target().to_utf8().trim_end_matches('.').to_string(), r.port()))
-        .filter(|(target, port)| !target.is_empty() && *port != 0)
-        .map(|(target, port)| format!("{target}:{port}"))
-        .unwrap_or_else(|| addr.to_string())
+        .filter_map(|r| {
+            let target = r.target().to_utf8().trim_end_matches('.').to_string();
+            (!target.is_empty() && r.port() != 0).then(|| (r.priority(), format!("{target}:{}", r.port())))
+        })
+        .collect();
+    let candidates = ordered_srv_candidates(records);
+    if candidates.is_empty() { vec![addr.to_string()] } else { candidates }
 }
 
 pub fn ping(addr: &str) -> Result<PingResult, String> {
+    ping_one(addr)
+}
+
+pub fn ping_candidates(candidates: &[String]) -> Result<PingResult, String> {
+    ping_candidates_with(candidates, ping_one)
+}
+
+fn ping_candidates_with(
+    candidates: &[String],
+    mut attempt: impl FnMut(&str) -> Result<PingResult, String>,
+) -> Result<PingResult, String> {
+    let started = std::time::Instant::now();
+    let mut failures = Vec::new();
+    for endpoint in candidates.iter().take(MAX_SRV_TARGETS) {
+        match attempt(endpoint) {
+            Ok(mut result) => {
+                result.ms = started.elapsed().as_millis() as u64;
+                return Ok(result);
+            }
+            Err(error) => failures.push(format!("{endpoint}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Err("не удалось разрешить адрес".into())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn connect_public_addresses<T>(
+    socks: impl Iterator<Item = std::net::SocketAddr>,
+    mut connect: impl FnMut(&std::net::SocketAddr) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut attempts = 0;
+    let mut last_error = None;
+    let mut saw_local = false;
+    for sock in socks {
+        // Check every resolved address, not just the first DNS answer. Never
+        // connect to a local/LAN answer, even when the name has public answers too.
+        if host_is_local(&sock.ip().to_string()) {
+            saw_local = true;
+            continue;
+        }
+        if attempts == MAX_ADDRESSES_PER_TARGET {
+            break;
+        }
+        attempts += 1;
+        match connect(&sock) {
+            Ok(connected) => return Ok(connected),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match (saw_local, last_error) {
+        (true, None) => Err(LOCAL_REFUSED.into()),
+        (_, Some(error)) => Err(error),
+        (false, None) => Err("не удалось разрешить адрес".into()),
+    }
+}
+
+fn ping_one(addr: &str) -> Result<PingResult, String> {
     let (host, port) = split_host_port(addr);
     // The webview picks the address, so without this the command is a probe for
     // the local machine, the LAN and cloud metadata. The literal host is judged
@@ -131,19 +209,13 @@ pub fn ping(addr: &str) -> Result<PingResult, String> {
     if host_is_local(&host) {
         return Err(LOCAL_REFUSED.into());
     }
-    let sock = (host.as_str(), port)
+    let socks = (host.as_str(), port)
         .to_socket_addrs()
-        .map_err(|e| e.to_string())?
-        .next()
-        .ok_or("не удалось разрешить адрес")?;
-    // The address a name resolved to is judged too, so DNS rebinding gains
-    // nothing.
-    if host_is_local(&sock.ip().to_string()) {
-        return Err(LOCAL_REFUSED.into());
-    }
+        .map_err(|e| e.to_string())?;
     let start = std::time::Instant::now();
-    // The only network connection in this file: TCP to a server you added to the list yourself.
-    let mut s = TcpStream::connect_timeout(&sock, Duration::from_secs(4)).map_err(|e| e.to_string())?;
+    let mut s = connect_public_addresses(socks, |sock| {
+        TcpStream::connect_timeout(sock, Duration::from_secs(4)).map_err(|e| e.to_string())
+    })?;
     s.set_read_timeout(Some(Duration::from_secs(4))).ok();
     s.set_write_timeout(Some(Duration::from_secs(4))).ok();
 
@@ -192,6 +264,70 @@ pub fn ping(addr: &str) -> Result<PingResult, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn srv_candidates_keep_priority_and_limit_fallbacks() {
+        let records = vec![
+            (20, "backup.example:25567".into()),
+            (10, "primary.example:25566".into()),
+            (10, "primary-two.example:25566".into()),
+            (10, "primary.example:25566".into()),
+            (30, "last.example:25568".into()),
+            (40, "ignored.example:25569".into()),
+        ];
+        assert_eq!(
+            ordered_srv_candidates(records),
+            vec![
+                "primary.example:25566".to_string(),
+                "primary-two.example:25566".to_string(),
+                "backup.example:25567".to_string(),
+                "last.example:25568".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn ping_candidates_try_the_next_endpoint_after_a_failure() {
+        let candidates = vec!["first.example:25565".into(), "second.example:25565".into()];
+        let mut tried = Vec::new();
+        let result = ping_candidates_with(&candidates, |candidate| {
+            tried.push(candidate.to_string());
+            if candidate == "first.example:25565" {
+                Err("unreachable".into())
+            } else {
+                Ok(PingResult {
+                    online: 1,
+                    max: 10,
+                    motd: "ok".into(),
+                    version: "test".into(),
+                    favicon: None,
+                    ms: 0,
+                })
+            }
+        });
+        assert_eq!(result.map(|r| r.motd), Ok("ok".into()));
+        assert_eq!(tried, candidates);
+    }
+
+    #[test]
+    fn address_fallback_skips_local_answers_and_tries_another_public_address() {
+        let socks: [std::net::SocketAddr; 3] = [
+            "127.0.0.1:25565".parse().unwrap(),
+            "203.0.113.10:25565".parse().unwrap(),
+            "198.51.100.20:25565".parse().unwrap(),
+        ];
+        let mut tried = Vec::new();
+        let result = connect_public_addresses(socks.into_iter(), |sock| {
+            tried.push(sock.ip().to_string());
+            if sock.ip().to_string() == "203.0.113.10" {
+                Err("unreachable".into())
+            } else {
+                Ok("connected")
+            }
+        });
+        assert_eq!(result, Ok("connected"));
+        assert_eq!(tried, vec!["203.0.113.10".to_string(), "198.51.100.20".to_string()]);
+    }
 
     /// address -> verdict. The webview reaches this command directly, so a ping
     /// must never turn into a port scan of the user's machine or LAN.
