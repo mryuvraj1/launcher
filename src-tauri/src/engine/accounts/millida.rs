@@ -455,9 +455,9 @@ fn set_refresh_cooldown(on: bool) {
     *guard = on.then(|| std::time::Instant::now() + REFRESH_COOLDOWN);
 }
 
-/// What a failed refresh says about the stored token pair. Only the server's
-/// own 401 condemns it: a 403 is what the edge shield answers to a suspicious
-/// IP, and 5xx/429/network errors say nothing about the session at all.
+/// What a failed refresh says about the stored token pair. A server 401 ends
+/// the session; a failed recovery after an unanswered request is also unsafe
+/// because that request may already have rotated the refresh token.
 #[derive(Debug, PartialEq, Eq)]
 enum RefreshVerdict {
     SessionOver,
@@ -914,8 +914,7 @@ async fn refresh_at(
         },
         Err(RefreshFailure::Unanswered(_)) => match refresh_once(&spare, base, refresh_token, attempt).await {
             Ok(pair) => Ok(pair),
-            Err(RefreshFailure::RotationUnusable) => Err(REFRESH_ROTATION_LOST.into()),
-            Err(RefreshFailure::Answered(e) | RefreshFailure::Unanswered(e)) => Err(e),
+            Err(_) => Err(REFRESH_ROTATION_LOST.into()),
         },
     }
 }
@@ -1388,6 +1387,18 @@ mod tests {
                 Err(super::REFRESH_ROTATION_LOST.to_string()),
                 2,
                 "if neither response restores the rotated cookie, the old token must not be stored or replayed",
+            ),
+            (
+                vec![Reply::Lost, Reply::Lost],
+                Err(super::REFRESH_ROTATION_LOST.to_string()),
+                2,
+                "two unanswered refreshes leave rotation state unknown; the spent token must not be retried after the grace window",
+            ),
+            (
+                vec![Reply::Lost, Reply::Status(503)],
+                Err(super::REFRESH_ROTATION_LOST.to_string()),
+                2,
+                "a second server error cannot prove that the first unanswered request did not rotate the token",
             ),
             (
                 vec![Reply::MissingAccess, Reply::Rotated],
