@@ -75,19 +75,6 @@ fn motd_text(v: &serde_json::Value) -> String {
 
 const LOCAL_REFUSED: &str = "локальные и домашние адреса лаунчер не проверяет";
 
-/// A bracketed IPv6 literal has to be split before the last colon is taken for
-/// a port, otherwise `[::1]:25565` and `::1` both end up as garbage hosts.
-fn split_host_port(addr: &str) -> (String, u16) {
-    if let Some((host, tail)) = addr.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
-        let port = tail.strip_prefix(':').and_then(|p| p.parse().ok()).unwrap_or(25565);
-        return (host.to_string(), port);
-    }
-    match addr.rsplit_once(':') {
-        Some((h, p)) if !h.contains(':') => (h.to_string(), p.parse().unwrap_or(25565)),
-        _ => (addr.to_string(), 25565),
-    }
-}
-
 const SRV_WAIT: Duration = Duration::from_secs(3);
 const MAX_SRV_TARGETS: usize = 4;
 const MAX_ADDRESSES_PER_TARGET: usize = 2;
@@ -108,12 +95,11 @@ fn ordered_srv_candidates(mut records: Vec<(u16, String)>) -> Vec<String> {
 }
 
 fn srv_name(addr: &str) -> Option<String> {
-    let (host, port) = split_host_port(addr);
-    let explicit_port = port != 25565 || addr.ends_with(":25565");
-    if explicit_port || host.is_empty() || host.parse::<std::net::IpAddr>().is_ok() {
+    let parsed = super::server_addr::parse_server_address(addr).ok()?;
+    if parsed.explicit_port || parsed.host.parse::<std::net::IpAddr>().is_ok() {
         return None;
     }
-    Some(format!("_minecraft._tcp.{}", host.trim_end_matches('.')))
+    Some(format!("_minecraft._tcp.{}", parsed.host.trim_end_matches('.')))
 }
 
 /// Candidate endpoints for a status check. A name without a port is looked up
@@ -201,7 +187,8 @@ fn connect_public_addresses<T>(
 }
 
 fn ping_one(addr: &str) -> Result<PingResult, String> {
-    let (host, port) = split_host_port(addr);
+    let parsed = super::server_addr::parse_server_address(addr)?;
+    let (host, port) = (parsed.host, parsed.port);
     // The webview picks the address, so without this the command is a probe for
     // the local machine, the LAN and cloud metadata. The literal host is judged
     // before any resolution, so a machine without IPv6 still refuses `::1`

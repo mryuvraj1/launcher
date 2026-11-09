@@ -3,6 +3,7 @@
 // the Millida skin server if that account is selected. Writes the launch log and crash snapshots to the modpack folder.
 use super::gameserver::track_server_hop;
 use super::pipeline::AuthSource;
+use super::server_addr::parse_server_address;
 use crate::engine::*;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -1862,20 +1863,8 @@ fn quick_play_supported(mc_version: &str) -> bool {
 
 /// Splits `host[:port]` and `[ipv6]:port`; a bare IPv6 address has no port.
 fn split_server_addr(addr: &str) -> (String, u16) {
-    const DEFAULT_PORT: u16 = 25565;
-    let a = addr.trim();
-    if let Some(rest) = a.strip_prefix('[') {
-        if let Some((host, tail)) = rest.split_once(']') {
-            let port = tail.strip_prefix(':').and_then(|p| p.parse().ok()).filter(|p| *p > 0).unwrap_or(DEFAULT_PORT);
-            return (host.to_string(), port);
-        }
-    }
-    match a.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => {
-            (host.to_string(), port.parse().ok().filter(|p| *p > 0).unwrap_or(DEFAULT_PORT))
-        }
-        _ => (a.to_string(), DEFAULT_PORT),
-    }
+    let parsed = parse_server_address(addr).expect("Quick Play validates server addresses before launch");
+    (parsed.host, parsed.port)
 }
 
 pub(crate) fn server_join_args(mc_version: &str, addr: &str) -> Vec<String> {
@@ -1985,7 +1974,6 @@ mod tests {
             ("23w13a", "a.net", legacy("a.net", "25565"), "one week before Quick Play"),
             ("1.19.4", "a.net", legacy("a.net", "25565"), "last release without Quick Play"),
             ("1.12.2", "a.net:25570", legacy("a.net", "25570"), "port goes to its own flag"),
-            ("1.7.10", "a.net:notaport", legacy("a.net", "25565"), "garbage port falls back to the default"),
             ("1.16.5", "[2001:db8::1]:25570", legacy("2001:db8::1", "25570"), "bracketed IPv6 with port"),
             ("1.16.5", "[2001:db8::1]", legacy("2001:db8::1", "25565"), "bracketed IPv6 without port"),
             ("1.16.5", "2001:db8::1", legacy("2001:db8::1", "25565"), "bare IPv6 has no port to split off"),

@@ -1,4 +1,5 @@
 // List of worlds in a modpack and deleting one world when the player asks. Only files in the saves/ folder of this modpack.
+use super::server_addr::parse_server_address;
 use crate::engine::*;
 use std::path::PathBuf;
 use tauri::AppHandle;
@@ -115,6 +116,9 @@ pub async fn quick_play(
     }
     if server.as_deref().is_some_and(|s| !cmdline_text_ok(s, 255) || s.starts_with('-')) {
         return Err("Некорректный адрес сервера".into());
+    }
+    if let Some(server) = server.as_deref() {
+        parse_server_address(server)?;
     }
     let quick = QuickTarget { world, server };
     install_and_launch_into(app, p.version.clone(), nick, p.fabric, ram_mb, profile, super::pipeline::AuthSource::Account(auth), quick).await

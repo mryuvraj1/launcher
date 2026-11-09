@@ -22,6 +22,7 @@ mod native_launch;
 mod horizon;
 mod game_invite;
 mod ping;
+mod server_addr;
 mod worlds;
 mod worldmgr;
 mod world_packs;
