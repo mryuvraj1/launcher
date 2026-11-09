@@ -464,8 +464,10 @@ enum RefreshVerdict {
     TryLater,
 }
 
+const REFRESH_ROTATION_LOST: &str = "refresh rotation could not be recovered";
+
 fn verdict_for(err: &str) -> RefreshVerdict {
-    if err == "http 401" { RefreshVerdict::SessionOver } else { RefreshVerdict::TryLater }
+    if err == "http 401" || err == REFRESH_ROTATION_LOST { RefreshVerdict::SessionOver } else { RefreshVerdict::TryLater }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -893,6 +895,8 @@ enum RefreshFailure {
     Answered(String),
     /// No verdict reached us, yet the server may already have rotated the pair.
     Unanswered(String),
+    /// A successful response did not contain a usable new token pair.
+    RotationUnusable,
 }
 
 async fn refresh_at(
@@ -904,8 +908,13 @@ async fn refresh_at(
     match refresh_once(&first, base, refresh_token, attempt).await {
         Ok(pair) => Ok(pair),
         Err(RefreshFailure::Answered(e)) => Err(e),
+        Err(RefreshFailure::RotationUnusable) => match refresh_once(&spare, base, refresh_token, attempt).await {
+            Ok(pair) => Ok(pair),
+            Err(_) => Err(REFRESH_ROTATION_LOST.into()),
+        },
         Err(RefreshFailure::Unanswered(_)) => match refresh_once(&spare, base, refresh_token, attempt).await {
             Ok(pair) => Ok(pair),
+            Err(RefreshFailure::RotationUnusable) => Err(REFRESH_ROTATION_LOST.into()),
             Err(RefreshFailure::Answered(e) | RefreshFailure::Unanswered(e)) => Err(e),
         },
     }
@@ -933,11 +942,11 @@ async fn refresh_once(
         .iter()
         .filter_map(|v| v.to_str().ok())
         .find_map(|c| cookie_value(c, REFRESH_COOKIE))
-        .unwrap_or_else(|| refresh_token.to_string());
-    let body: Value = res.json().await.map_err(|e| RefreshFailure::Unanswered(e.to_string()))?;
+        .ok_or(RefreshFailure::RotationUnusable)?;
+    let body: Value = res.json().await.map_err(|_| RefreshFailure::RotationUnusable)?;
     let access = body["accessToken"].as_str().unwrap_or_default().to_string();
     if access.is_empty() {
-        return Err(RefreshFailure::Answered("в ответе нет accessToken".into()));
+        return Err(RefreshFailure::RotationUnusable);
     }
     Ok((access, next))
 }
@@ -1287,6 +1296,8 @@ mod tests {
     enum Reply {
         Lost,
         Status(u16),
+        MissingRotation,
+        MissingAccess,
         Rotated,
     }
 
@@ -1318,6 +1329,20 @@ mod tests {
                     }
                     Reply::Status(code) => {
                         format!("HTTP/1.1 {code} Nope\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}")
+                    }
+                    Reply::MissingRotation => {
+                        let body = r#"{"accessToken":"fresh-access"}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    Reply::MissingAccess => {
+                        let body = r#"{"status":"ok"}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\nSet-Cookie: rt2=fresh-refresh; Path=/\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
                     }
                     Reply::Rotated => {
                         let body = r#"{"accessToken":"fresh-access"}"#;
@@ -1351,6 +1376,24 @@ mod tests {
                 "the server rotated the pair but the reply never came back: only a resend inside the \
                  60 s grace gets the new pair, a later one is judged reuse and signs the player out \
                  (prod 20.10.2026: 519 of 1503 desktop revocations in three days landed at 90-100 s)",
+            ),
+            (
+                vec![Reply::MissingRotation, Reply::Rotated],
+                ok.clone(),
+                2,
+                "a 200 response without the rotated cookie must be retried inside the grace, not paired with the spent token",
+            ),
+            (
+                vec![Reply::MissingRotation, Reply::MissingRotation],
+                Err(super::REFRESH_ROTATION_LOST.to_string()),
+                2,
+                "if neither response restores the rotated cookie, the old token must not be stored or replayed",
+            ),
+            (
+                vec![Reply::MissingAccess, Reply::Rotated],
+                ok.clone(),
+                2,
+                "a rotated cookie without its matching access token is an unusable pair and must be recovered together",
             ),
             (vec![Reply::Rotated], ok.clone(), 1, "an answered refresh is sent exactly once"),
             (
@@ -1386,6 +1429,7 @@ mod tests {
             super::REFRESH_ATTEMPT * 2 < std::time::Duration::from_secs(60),
             "two refresh attempts must fit inside the server's 60 s rotation grace, otherwise the resend revokes the session",
         );
+        assert_eq!(super::verdict_for(super::REFRESH_ROTATION_LOST), super::RefreshVerdict::SessionOver);
     }
 
 }
